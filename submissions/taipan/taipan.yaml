@@ -1,0 +1,428 @@
+name: "taipan_v2"
+version: "2.1.0"
+description: >
+  Taipan v2.1 — Phase 0 Complete · All SDK Parameters Corrected
+
+  FIX #A — GUN WEZ PARAMETERS (CRITICAL)
+    All weapon branches used WRONG WEZ values from memory.
+    Actual WEZ from wez_params.yaml:
+      ATA < 12° (NOT 20° or 40°!)
+      Distance: 500–3000 ft (NOT 152–914 ft!)
+    GunEngagement: ATA 20°→8°, dist 152–914→500–3000 ft
+    SnapShot: ATA 40°→12°, dist min 0→500 ft added
+    At ATA > 12°, GunAttack deals ZERO damage — SnapShot at 40° was
+    wasting every tick it fired. Now both branches are WEZ-aware.
+
+  FIX #B — THREAT RESPONSE RANGE (CRITICAL)
+    ThreatResponse InEnemyWEZ used max_distance_ft=914 — detecting
+    enemy threat only when they were already past 1/3 of the WEZ.
+    At 914 ft the enemy has been dealing damage for 2000+ ft already.
+    Fixed: max_distance_ft=3000 (full WEZ range), max_los_angle_deg=12.
+
+  FIX #C — GEOMETRY BREAKER CONDITION (IMPROVEMENT)
+    Old internal ATA > 60° guard replaced by built-in IsTwoCircle
+    condition node (HCA > 90°). IsTwoCircle is the SDK's canonical
+    indicator for two-circle geometry — more precise than a raw ATA
+    threshold because it checks HCA (heading crossing angle), not just
+    where the enemy is relative to our nose.
+
+  FIX #D — CUSTOM NODES NOW IMPLEMENTED (BLOCKING BUG)
+    SmartEvasionAction and GeometryBreakerAction are now implemented
+    in custom_actions.py. Agent was unrunnable before this fix.
+
+  ═══════════════════════════════════════════════════════════════
+  ORIGINAL DIAGNOSTIC FINDINGS (9 ACMI matches, April 2026)
+  ═══════════════════════════════════════════════════════════════
+
+  BUG #1 — YAML GHOST
+    The tested agent ran on an old Mamba-derived tree (NodePath showed
+    "CloseCombat"). Taipan v1 never ran in production. v2 validates
+    via NodePath showing "Taipan_Root".
+
+  BUG #2 — ALTITUDE TRAP
+    AltitudeAdvantage fired 49–64% of all steps unconditionally.
+    Fix: gated behind dist > 6000 ft only (VerticalApproach [8]).
+
+  BUG #3 — WEAPON ORDERING
+    LeadPursuit stole 18+ confirmed WEZ firing windows.
+    Fix: GunEngagement is branch [2], before ALL pursuit nodes.
+
+  BUG #4 — EAGLE1 GEOMETRIC DEADLOCK
+    ATA never below 56.6° across 3 matches. Two-circle deadlock
+    in 3000–6000 ft zone.
+    Fix: GeometryBreaker [6] with IsTwoCircle guard + vertical burst.
+
+  ═══════════════════════════════════════════════════════════════
+  BRANCH ARCHITECTURE (9 branches — clean, non-overlapping)
+  ═══════════════════════════════════════════════════════════════
+
+  Priority  Branch              Zone           Condition
+  ────────  ──────────────────  ─────────────  ──────────────────────────────
+  [1]       HardDeckAvoidance   any altitude   alt < 1300 ft
+  [2]       GunEngagement       500–3000 ft    ATA < 8°  ← precision shot
+  [3]       SnapShot            500–3000 ft    ATA < 12° ← opportunity shot
+  [4]       ThreatResponse      any            InEnemyWEZ(3000 ft, 12°)
+  [5]       OffensivePress      < 4000 ft      IsOffensiveSituation
+  [6]       GeometryBreaker     2500–6000 ft   IsTwoCircle (HCA > 90°)
+  [7]       ForcedApproach      < 10000 ft     ATA < 30°
+  [8]       VerticalApproach    > 6000 ft      unconditional climb
+  [9]       Default             any            LeadPursuit
+
+  ═══════════════════════════════════════════════════════════════
+  CUSTOM NODES (custom_actions.py)
+  ═══════════════════════════════════════════════════════════════
+  SmartEvasionAction    — direction+altitude aware break turn
+                          (side_flag → heading; alt_gap_ft → vertical)
+  GeometryBreakerAction — TimedAction, 6s vertical burst, 2-phase
+                          (climb 4s → dive setup 2s)
+
+  ═══════════════════════════════════════════════════════════════
+  WIN CONDITIONS BY OPPONENT
+  ═══════════════════════════════════════════════════════════════
+  Simple    : GunEngagement [2] + SnapShot [3] — brute damage
+  Eagle1    : GeometryBreaker [6] breaks deadlock → VerticalApproach [8]
+              → GunEngagement [2] during dive pass
+  Golden    : ForcedApproach [7] closes to WEZ → GunEngagement [2]
+  Aggressive: ThreatResponse [4] → OffensivePress [5] → GunEngagement [2]
+  Defensive : ForcedApproach [7] + GeometryBreaker [6] commits geometry
+  Viper1    : OffensivePress [5] + GunEngagement [2]
+  Ace (WIP) : ThreatResponse [4] (Ace fires precisely) + energy management
+              → Phase 1 investigation target after v2.1 baseline confirmed
+  Unknown   : Full 9-branch cascade handles unknown styles via priority order
+
+  ═══════════════════════════════════════════════════════════════
+  SDK PARAMETER REFERENCE (confirmed from docs)
+  ═══════════════════════════════════════════════════════════════
+  WEZ: ATA < 12°, dist 500–3000 ft, base 25 HP/s (angle+dist multiplier)
+  Hard Deck: 1000 ft (immediate loss). BT trigger: 1300 ft (300 ft margin)
+  Match: 6000 steps @ 20 Hz = 300 seconds (5 minutes)
+  BT tick: 10 Hz. TimedAction reference: 5 Hz (auto-scaled)
+  duration_steps=15 = 3.0 seconds. duration_steps=30 = 6.0 seconds.
+
+
+tree:
+  type: Selector
+  name: Taipan_Root
+  children:
+
+    # ═══════════════════════════════════════════════════════════════
+    # [1] HARD DECK AVOIDANCE — Survival (always highest priority)
+    #
+    # Trigger: alt < 1300 ft (300 ft safety margin above 1000 ft hard deck)
+    # Recovery: climb to 3000 ft
+    #
+    # WHY 1300 ft trigger:
+    #   Hard deck = 1000 ft (immediate loss on violation).
+    #   Max descent rate at full throttle ≈ 250 ft/s.
+    #   At 1300 ft trigger → ~1.2 s before hard deck. Enough to pitch up.
+    #   The GUIDE recommends "threshold_ft: 3281" (1000 m) as an extra-safe
+    #   margin. We use 1300 ft to preserve more low-altitude fighting
+    #   altitude while still having a safe reaction window.
+    #
+    # OPPONENT NOTE: Ace's hard deck trigger is 1000 ft (minimum margin).
+    #   If we force Ace below 1000 ft by staying in a diving engagement,
+    #   Ace triggers its own hard deck recovery and loses offensive position.
+    # ═══════════════════════════════════════════════════════════════
+    - type: Sequence
+      name: HardDeckAvoidance
+      children:
+        - type: Condition
+          name: BelowHardDeck
+          params:
+            threshold_ft: 1300
+        - type: Action
+          name: ClimbTo
+          params:
+            target_altitude_ft: 3000
+
+    # ═══════════════════════════════════════════════════════════════
+    # [2] GUN ENGAGEMENT — Precision weapon (MUST precede all pursuit)
+    #
+    # Gate: 500 ft ≤ dist ≤ 3000 ft AND ATA < 8°
+    # Action: GunAttack
+    #
+    # FIX #A: Distance corrected from 152–914 ft → 500–3000 ft (real WEZ).
+    # FIX #A: ATA threshold corrected from 20° → 8° (WEZ activates at 12°;
+    #   8° is the precision zone where damage multiplier is highest).
+    #
+    # WHY 8° (not 12°): At ATA=12°, cos(12°)=0.978 → near-full damage.
+    #   At ATA=8°, cos(8°)=0.990 → effectively maximum damage rate.
+    #   Using 8° ensures this branch fires only when we have a clean,
+    #   high-confidence shot. Marginal 8–12° angles are caught by SnapShot [3].
+    #   Tighter gate also means fewer false-trigger steps where GunAttack
+    #   fires but the enemy breaks turn mid-shot.
+    #
+    # WHY 500 ft min: WEZ minimum range per wez_params.yaml.
+    #   Below 500 ft the projectile has not traveled enough to arm.
+    #
+    # WHY 3000 ft max: WEZ maximum range per wez_params.yaml.
+    #   Beyond 3000 ft, GunAttack deals zero damage regardless of ATA.
+    #
+    # FIX #3 (original): This branch is [2], BEFORE all pursuit nodes.
+    #   In the old tree, pursuit nodes were evaluated first, stealing
+    #   18+ confirmed firing windows where conditions were already perfect.
+    # ═══════════════════════════════════════════════════════════════
+    - type: Sequence
+      name: GunEngagement
+      children:
+        - type: Condition
+          name: DistanceBelow
+          params:
+            threshold_ft: 3000
+        - type: Condition
+          name: DistanceAbove
+          params:
+            threshold_ft: 500
+        - type: Condition
+          name: ATABelow
+          params:
+            threshold_deg: 8.0
+        - type: Action
+          name: GunAttack
+
+    # ═══════════════════════════════════════════════════════════════
+    # [3] SNAP SHOT — Opportunity fire at WEZ boundary angles
+    #
+    # Gate: 500 ft ≤ dist ≤ 3000 ft AND ATA < 12°
+    # Action: GunAttack
+    #
+    # FIX #A: ATA corrected from 40° → 12° (the actual WEZ boundary).
+    #   CRITICAL: At ATA > 12°, GunAttack deals ZERO damage.
+    #   The old 40° threshold meant SnapShot was firing on ~35% of close
+    #   range ticks where we had zero chance of dealing any damage.
+    #   All those ticks were pure waste.
+    #
+    # FIX #A: Added DistanceAbove(500) — WEZ minimum range.
+    #
+    # WHEN IT FIRES (relative to GunEngagement):
+    #   GunEngagement covers ATA < 8°. The Selector evaluates [2] first.
+    #   SnapShot only fires when [2] fails — i.e., when ATA is 8°–12°.
+    #   This is the "marginal shot" zone: still in WEZ but not maximum damage.
+    #
+    # TACTICAL USE CASES:
+    #   - During a GeometryBreaker dive pass: as we cross the enemy's
+    #     flight path, ATA sweeps through 0°–20°. At 8°–12° we fire SnapShot.
+    #   - Post-merge crossing where GunEngagement's 8° gate is briefly missed.
+    #   - Any close-range pass where geometry is imperfect but within WEZ.
+    # ═══════════════════════════════════════════════════════════════
+    - type: Sequence
+      name: SnapShot
+      children:
+        - type: Condition
+          name: DistanceBelow
+          params:
+            threshold_ft: 3000
+        - type: Condition
+          name: DistanceAbove
+          params:
+            threshold_ft: 500
+        - type: Condition
+          name: ATABelow
+          params:
+            threshold_deg: 12.0
+        - type: Action
+          name: GunAttack
+
+    # ═══════════════════════════════════════════════════════════════
+    # [4] THREAT RESPONSE — Evasion when inside enemy WEZ
+    #
+    # Gate: InEnemyWEZ(3000 ft, 12°) — enemy can currently deal damage to us
+    # Action: SmartEvasionAction (custom — direction+altitude aware)
+    #
+    # FIX #B: max_distance_ft corrected from 914 → 3000 (real WEZ max).
+    #   Old value of 914 ft meant we were not detecting threat until the
+    #   enemy had already been shooting at us for 2000+ ft of range.
+    #   By the time we detected the threat at 914 ft, we may have already
+    #   absorbed 2–3 seconds of damage.
+    #
+    # FIX #B: max_los_angle_deg corrected from 15 → 12 (real WEZ angle).
+    #   This ensures ThreatResponse activates exactly when the enemy enters
+    #   their actual WEZ — not at a tighter (false-safe) or looser (false-alarm)
+    #   threshold.
+    #
+    # WHY SmartEvasionAction (not built-in BreakTurn):
+    #   BreakTurn always descends. After 2–3 evasions, predictable.
+    #   SmartEvasionAction uses alt_gap_ft to decide altitude component:
+    #   if enemy is ABOVE us → climb slightly (deny diving WEZ entry);
+    #   if enemy is BELOW → hold altitude (maintain our height advantage);
+    #   if co-altitude → descend (pure horizontal break, maximizes turn rate).
+    #
+    # PLACEMENT NOTE: ThreatResponse is after the two weapon branches [2][3].
+    #   If we are simultaneously in firing position AND under threat, we fire
+    #   first. Mutual fire at ATA < 8° favors the agent with better aim.
+    # ═══════════════════════════════════════════════════════════════
+    - type: Sequence
+      name: ThreatResponse
+      children:
+        - type: Condition
+          name: InEnemyWEZ
+          params:
+            max_distance_ft: 3000.0
+            max_los_angle_deg: 12.0
+        - type: Action
+          name: SmartEvasionAction
+
+    # ═══════════════════════════════════════════════════════════════
+    # [5] OFFENSIVE PRESS — Commit when BFM advantage confirmed
+    #
+    # Gate: dist < 4000 ft AND IsOffensiveSituation
+    # Action: Pursue
+    #
+    # WHY IsOffensiveSituation: SDK-defined composite check:
+    #   ATA < 45°, AA < 100°, dist 0.3–3 NM + energy/3-9 Line advantage.
+    #   Only fires when we have a genuine BFM advantage — prevents Pursue
+    #   from committing during neutral or adverse geometry.
+    #
+    # WHY Pursue (not LeadPursuit): At confirmed BFM advantage, Pursue's
+    #   adaptive multi-parameter logic tracks the target more reliably
+    #   during break turns (LeadPursuit predicts future position which
+    #   causes overshoots on hard breaks — confirmed in Cobra v10 logs).
+    #
+    # WHY 4000 ft gate: at dist > 4000 ft, BFM advantage decays quickly
+    #   and the opponent has time to reset geometry. At dist < 4000 ft,
+    #   committing with Pursue delivers before the opponent can respond.
+    # ═══════════════════════════════════════════════════════════════
+    - type: Sequence
+      name: OffensivePress
+      children:
+        - type: Condition
+          name: DistanceBelow
+          params:
+            threshold_ft: 4000
+        - type: Condition
+          name: IsOffensiveSituation
+        - type: Action
+          name: Pursue
+
+    # ═══════════════════════════════════════════════════════════════
+    # [6] GEOMETRY BREAKER — Shatters two-circle turning deadlock
+    #
+    # Gate: dist ∈ [2500, 6000 ft] AND IsTwoCircle (HCA > 90°)
+    # Action: GeometryBreakerAction (TimedAction, 6s vertical burst)
+    #
+    # FIX #C: Replaced internal ATA > 60° guard with built-in IsTwoCircle.
+    #   IsTwoCircle checks HCA (Heading Crossing Angle) > 90°, which is
+    #   the canonical SDK definition of two-circle geometry. More accurate
+    #   than raw ATA because it measures how the two aircraft headings cross,
+    #   not just where the enemy is relative to our nose.
+    #
+    # FIX #4 (original): GeometryBreaker covers the 2500–6000 ft zone where
+    #   Eagle1 created an unbreakable deadlock. Old VerticalApproach only
+    #   fired at dist > 6000 ft (9.3% of Eagle1 match time), leaving the
+    #   deadlock zone (78.5% of time) unaddressed.
+    #
+    # HOW GeometryBreakerAction WORKS:
+    #   Phase 1 (4s): Hard climb + mild turn toward enemy.
+    #     → Vertical separation from flat-circle fight
+    #     → Distance increases toward > 6000 ft
+    #   Phase 2 (2s): Begin dive setup + full afterburner.
+    #     → Altitude → speed conversion for dive pass
+    #     → VerticalApproach [8] continues the climb at dist > 6000 ft
+    #     → GunEngagement [2] fires during the dive pass crossing
+    #
+    # MEMORY SEMANTICS: memory=false (default Sequence).
+    #   If IsTwoCircle becomes false mid-burst (geometry improved!),
+    #   the Sequence fails and higher-priority branches take over.
+    #   GeometryBreakerAction.on_finish(INVALID) resets state cleanly.
+    #
+    # CROSS-OPPONENT SAFETY:
+    #   vs Simple: Simple never reaches 2500–6000 ft ATA-deadlock zone.
+    #     GunEngagement fires before this branch is ever evaluated.
+    #   vs Golden/Aggressive: OffensivePress [5] fires before GeometryBreaker
+    #     when IsOffensiveSituation is true. GeometryBreaker only fires when
+    #     we DON'T have offensive advantage + IsTwoCircle is true → correct.
+    # ═══════════════════════════════════════════════════════════════
+    - type: Sequence
+      name: GeometryBreaker
+      children:
+        - type: Condition
+          name: DistanceBelow
+          params:
+            threshold_ft: 6000
+        - type: Condition
+          name: DistanceAbove
+          params:
+            threshold_ft: 2500
+        - type: Condition
+          name: IsTwoCircle
+        - type: Action
+          name: GeometryBreakerAction
+
+    # ═══════════════════════════════════════════════════════════════
+    # [7] FORCED APPROACH — Close distance when roughly aligned
+    #
+    # Gate: dist < 10000 ft AND ATA < 30°
+    # Action: Pursue
+    #
+    # WHY 30° ATA gate: ACMI data showed ForcedApproach(25°) barely fired
+    #   vs Golden because the ATA distribution median was 84–88°.
+    #   Widening to 30° captures more closing opportunities without causing
+    #   overshoots (30° still requires meaningful alignment toward WEZ).
+    #
+    # WHY 10000 ft distance gate: Beyond 10000 ft, a straight closing approach
+    #   gives the opponent time to reset geometry. Within 10000 ft, Pursue
+    #   can reach the WEZ in ~10 BT ticks if ATA < 30°.
+    #
+    # RANGE NOTE: At dist < 2500 ft, GunEngagement/SnapShot and OffensivePress
+    #   handle before ForcedApproach is evaluated. No overlap conflicts.
+    # ═══════════════════════════════════════════════════════════════
+    - type: Sequence
+      name: ForcedApproach
+      children:
+        - type: Condition
+          name: DistanceBelow
+          params:
+            threshold_ft: 10000
+        - type: Condition
+          name: ATABelow
+          params:
+            threshold_deg: 30.0
+        - type: Action
+          name: Pursue
+
+    # ═══════════════════════════════════════════════════════════════
+    # [8] VERTICAL APPROACH — Altitude advantage at long range
+    #
+    # Gate: dist > 6000 ft (only)
+    # Action: AltitudeAdvantage
+    #
+    # FIX #2 (original): Now ONLY fires at dist > 6000 ft.
+    #   In the old tree, AltitudeAdvantage ran unconditionally in the fallback
+    #   parallel branch → 49–64% of all steps wasted climbing.
+    #
+    # THREE SCENARIOS WHERE THIS FIRES:
+    #   1. Opening phase: first ~20 BT ticks of each match while dist > 6000 ft
+    #   2. Post-GeometryBreakerAction: vertical burst pushes dist beyond 6000 ft
+    #   3. After ThreatResponse break: evasion may open distance to > 6000 ft
+    #   In all cases, altitude advantage is the correct long-range behavior.
+    # ═══════════════════════════════════════════════════════════════
+    - type: Sequence
+      name: VerticalApproach
+      children:
+        - type: Condition
+          name: DistanceAbove
+          params:
+            threshold_ft: 6000
+        - type: Action
+          name: AltitudeAdvantage
+
+    # ═══════════════════════════════════════════════════════════════
+    # [9] DEFAULT — Last-resort neutral pursuit
+    #
+    # No conditions — catches all states not handled above.
+    # Action: LeadPursuit
+    #
+    # WHY LeadPursuit (not Pursue): At this point, no other branch fired,
+    #   which means: not near hard deck, not in WEZ, not under threat, no
+    #   BFM advantage, geometry is NOT two-circle (GeometryBreaker would
+    #   have fired), ATA ≥ 30° (ForcedApproach not firing), dist < 6000 ft
+    #   (VerticalApproach not firing). This is mostly a neutral geometry
+    #   close-range situation where LeadPursuit's predictive lead tracking
+    #   builds toward WEZ entry more efficiently than reactive Pursue.
+    #
+    # WHEN IT ACTUALLY FIRES:
+    #   Primarily: dist < 2500 ft + ATA > 12° (not in WEZ, not two-circle)
+    #   during a tight co-energy turning engagement. LeadPursuit is correct here.
+    # ═══════════════════════════════════════════════════════════════
+    - type: Action
+      name: LeadPursuit
